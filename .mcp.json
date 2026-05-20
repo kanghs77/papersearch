@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "alphaxiv": {
+      "type": "http",
+      "url": "https://api.alphaxiv.org/mcp/v1"
+    }
+  }
+}
+
+{
+  "mcpServers": {
+    "alphaxiv": {
+      "type": "http",
+      "url": "https://api.alphaxiv.org/mcp/v1"
+    },
+    "semantic-scholar": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "git+https://github.com/FujishigeTemma/semantic-scholar-mcp",
+        "semantic-scholar-mcp",
+        "serve"
+      ],
+      "env": {
+        "SEMANTIC_SCHOLAR_API_KEY": "${SEMANTIC_SCHOLAR_API_KEY}"
+      }
+    }
+  }
+}
