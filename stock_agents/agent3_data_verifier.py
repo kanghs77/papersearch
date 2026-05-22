@@ -56,7 +56,7 @@ def _verify_op_naver(code: str, our_op: float):
     if not resp:
         return None, None
 
-    soup = BeautifulSoup(resp.text, 'lxml')
+    soup = BeautifulSoup(resp.text, 'html.parser')
     table = soup.find('table', class_='tb_type1')
     if not table:
         return None, None

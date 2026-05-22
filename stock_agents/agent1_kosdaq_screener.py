@@ -42,7 +42,7 @@ def _get_kosdaq_tickers_naver():
         resp = get_request(url, params=params, headers=_HEADERS, encoding='euc-kr')
         if not resp:
             break
-        soup = BeautifulSoup(resp.text, 'lxml')
+        soup = BeautifulSoup(resp.text, 'html.parser')
         rows = soup.select('table.type_2 tr[onmouseover]')
         if not rows:
             break
@@ -84,7 +84,7 @@ def _scrape_op_naver(code: str):
     if not resp:
         return None
 
-    soup = BeautifulSoup(resp.text, 'lxml')
+    soup = BeautifulSoup(resp.text, 'html.parser')
     table = soup.find('table', class_='tb_type1')
     if not table:
         return None

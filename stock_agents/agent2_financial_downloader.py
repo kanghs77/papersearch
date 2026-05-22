@@ -56,7 +56,7 @@ def _scrape_finsum(code: str):
     if not resp:
         return None
 
-    soup = BeautifulSoup(resp.text, 'lxml')
+    soup = BeautifulSoup(resp.text, 'html.parser')
     table = soup.find('table', class_='tb_type1')
     if not table:
         return None
