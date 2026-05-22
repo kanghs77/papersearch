@@ -1,25 +1,19 @@
 """
-Agent 2: 영업이익 흑자 기업 5개년 재무제표 + 주요 지표 수집
+Agent 2: 흑자 기업 5개년 재무제표 + 주요 지표 수집
 
-[Production 모드]
-  - Naver Finance / Wisereport 스크래핑
-  - pykrx (KRX_ID/KRX_PW) 또는 직접 파싱으로 PER 수집
-  - 병렬 처리로 수백 종목 처리
-
-[Demo 모드]
-  - demo_generator의 합성 데이터 사용
+데이터 소스: yfinance (.KQ) → Naver Finance 순서
+수집 항목: 매출액, 영업이익, 순이익, ROE, ROA, EPS, PER, PBR
 """
-import os
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import DATA_DIR, DATA_MODE, SCRAPE_MAX_WORKERS, ANALYSIS_YEARS, YEAR_END_DATES
+from config import DATA_DIR, DATA_MODE, SCRAPE_MAX_WORKERS
 from utils import get_request, logger
 
-INPUT_FILE = DATA_DIR / 'agent1_positive_op.csv'
+INPUT_FILE  = DATA_DIR / 'agent1_positive_op.csv'
 OUTPUT_FILE = DATA_DIR / 'agent2_financial_data.csv'
 OUTPUT_EXCEL = DATA_DIR / 'agent2_financial_data.xlsx'
-DETAIL_DIR = DATA_DIR / 'agent2_details'
+DETAIL_DIR  = DATA_DIR / 'agent2_details'
 DETAIL_DIR.mkdir(exist_ok=True)
 
 _HEADERS = {
@@ -30,24 +24,77 @@ _HEADERS = {
     ),
 }
 
-METRIC_MAP = {
+_NAVER_METRICS = {
     '매출액': 'revenue',
     '영업이익': 'operating_profit',
     '영업이익률': 'operating_margin',
     '당기순이익': 'net_income',
-    'ROE': 'roe',
-    'ROA': 'roa',
-    'EPS': 'eps',
-    'BPS': 'bps',
+    'ROE': 'roe', 'ROA': 'roa',
+    'EPS': 'eps', 'BPS': 'bps',
 }
 
 
-# ══════════════════════════════════════════════════════════════
-#  Production 모드 스크래핑 함수
-# ══════════════════════════════════════════════════════════════
+# ── yfinance 수집 ────────────────────────────────────────────────
 
-def _scrape_finsum(code: str):
-    """Naver Finance finsum_more에서 연간 재무 요약 파싱"""
+def _fetch_yfinance(code: str):
+    """yfinance로 연간 재무제표 + 주요 지표 수집"""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(f"{code}.KQ")
+
+        # ① 손익계산서
+        fin = t.financials    # 컬럼=연도, 행=지표
+        if fin is None or fin.empty:
+            return None
+
+        records = []
+        for date in fin.columns:
+            yr = str(date.year)
+            row = {'ticker': code, 'year': yr}
+
+            def get_field(names):
+                for n in names:
+                    if n in fin.index and pd.notna(fin.loc[n, date]):
+                        return float(fin.loc[n, date]) / 1e8   # KRW → 억원
+                return None
+
+            row['revenue']          = get_field(['Total Revenue', 'Revenue'])
+            row['operating_profit'] = get_field(['Operating Income', 'Operating Profit', 'EBIT'])
+            row['net_income']       = get_field(['Net Income', 'Net Income Common Stockholders'])
+
+            if row['revenue'] and row['operating_profit'] and row['revenue'] > 0:
+                row['operating_margin'] = round(row['operating_profit'] / row['revenue'] * 100, 2)
+
+            records.append(row)
+
+        if not records:
+            return None
+
+        # ② 현재 PER/PBR/ROE
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            pass
+
+        latest_year = str(fin.columns[0].year)
+        for rec in records:
+            if rec['year'] == latest_year:
+                rec['per'] = info.get('trailingPE') or info.get('forwardPE')
+                rec['pbr'] = info.get('priceToBook')
+                rec['roe'] = round(info.get('returnOnEquity', 0) * 100, 2) if info.get('returnOnEquity') else None
+                rec['roa'] = round(info.get('returnOnAssets', 0) * 100, 2) if info.get('returnOnAssets') else None
+
+        return records
+    except Exception as e:
+        logger.debug(f"{code} yfinance 실패: {e}")
+        return None
+
+
+# ── Naver Finance fallback ───────────────────────────────────────
+
+def _fetch_naver(code: str):
+    """Naver Finance finsum_more에서 연간 재무 파싱 (fallback)"""
     from bs4 import BeautifulSoup
     url = 'https://finance.naver.com/item/coinfo.naver'
     params = {'code': code, 'target': 'finsum_more'}
@@ -57,7 +104,8 @@ def _scrape_finsum(code: str):
         return None
 
     soup = BeautifulSoup(resp.text, 'html.parser')
-    table = soup.find('table', class_='tb_type1')
+    table = (soup.find('table', class_='tb_type1') or
+             soup.find('table', attrs={'class': lambda c: c and 'tb_type1' in str(c)}))
     if not table:
         return None
 
@@ -65,124 +113,83 @@ def _scrape_finsum(code: str):
     thead = table.find('thead')
     if thead:
         for th in thead.find_all('th'):
-            txt = th.text.strip()
-            if txt and txt != '구분':
-                years.append(txt)
+            t_ = th.text.strip()
+            if t_ and t_ != '구분':
+                years.append(t_)
     if not years:
         return None
 
-    result = {yr: {} for yr in years}
-    tbody = table.find('tbody')
-    if not tbody:
-        return None
-
-    for tr in tbody.find_all('tr'):
+    data = {yr: {'ticker': code, 'year': yr} for yr in years}
+    for tr in (table.find('tbody') or table).find_all('tr'):
         th = tr.find('th')
         if not th:
             continue
         label = th.text.strip()
-        for kor, eng in METRIC_MAP.items():
+        for kor, eng in _NAVER_METRICS.items():
             if kor in label:
                 for i, td in enumerate(tr.find_all('td')):
                     if i >= len(years):
                         break
                     raw = td.text.strip().replace(',', '').replace('\xa0', '').replace('%', '')
                     try:
-                        result[years[i]][eng] = float(raw)
+                        data[years[i]][eng] = float(raw)
                     except ValueError:
                         pass
-    return result if any(result.values()) else None
+
+    records = [v for v in data.values() if len(v) > 2]
+    return records if records else None
 
 
-def _get_per_pykrx(code: str):
-    """pykrx로 연도별 PER 수집 (KRX 인증 필요)"""
-    krx_id = os.environ.get('KRX_ID')
-    krx_pw = os.environ.get('KRX_PW')
-    if not (krx_id and krx_pw):
-        return {}
-    try:
-        from pykrx import stock
-        fund_data = {}
-        for year, date_str in YEAR_END_DATES.items():
-            df = stock.get_market_fundamental(date_str, ticker=code)
-            if df is not None and not df.empty:
-                row = df.iloc[0]
-                fund_data[str(year)] = {
-                    'per': round(float(row.get('PER', 0) or 0), 2),
-                    'pbr': round(float(row.get('PBR', 0) or 0), 2),
-                }
-            time.sleep(0.05)
-        return fund_data
-    except Exception as e:
-        logger.debug(f"{code} pykrx 실패: {e}")
-        return {}
+# ── 종목 처리 ────────────────────────────────────────────────────
 
-
-def _process_one_ticker_production(row):
-    """단일 종목 실제 스크래핑"""
-    code = row['ticker']
+def _process(row):
+    code = str(row['ticker']).zfill(6)
     name = row.get('name', '')
-    income = _scrape_finsum(code)
-    per_data = _get_per_pykrx(code)
+    records = _fetch_yfinance(code) or _fetch_naver(code)
+    if records:
+        for r in records:
+            r.setdefault('ticker', code)
+            r.setdefault('name', name)
+    return code, records
 
-    records = []
-    all_years = set()
-    if income:
-        all_years.update(income.keys())
-    if per_data:
-        all_years.update(per_data.keys())
 
-    for yr_str in sorted(all_years):
-        rec = {'ticker': code, 'name': name, 'year': yr_str}
-        if income and yr_str in income:
-            rec.update(income[yr_str])
-        yr_key = yr_str.split('.')[0]
-        if per_data and yr_key in per_data:
-            rec.update(per_data[yr_key])
-        records.append(rec)
-    return records
-
+# ── Production 실행 ──────────────────────────────────────────────
 
 def _run_production(df_input):
     all_records = []
-    success, fail = 0, 0
+    success = fail = 0
+    workers = min(SCRAPE_MAX_WORKERS, 8)
 
-    with ThreadPoolExecutor(max_workers=SCRAPE_MAX_WORKERS) as ex:
-        futures = {ex.submit(_process_one_ticker_production, row): row['ticker']
-                   for _, row in df_input.iterrows()}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_process, row): row['ticker'] for _, row in df_input.iterrows()}
         done = 0
         for f in as_completed(futures):
             done += 1
             code = futures[f]
-            records = f.result()
+            code_, records = f.result()
             if records:
                 all_records.extend(records)
                 pd.DataFrame(records).to_csv(
-                    DETAIL_DIR / f'{code}.csv', index=False, encoding='utf-8-sig')
+                    DETAIL_DIR / f'{code_}.csv', index=False, encoding='utf-8-sig')
                 success += 1
             else:
                 fail += 1
             if done % 50 == 0:
-                logger.info(f"진행: {done}/{len(df_input)} | 성공: {success} | 실패: {fail}")
-            time.sleep(0.1)
+                logger.info(f"  진행: {done}/{len(df_input)} | 성공: {success} | 실패: {fail}")
+            time.sleep(0.3 / workers)
 
     return pd.DataFrame(all_records)
 
 
-# ══════════════════════════════════════════════════════════════
-#  Demo 모드
-# ══════════════════════════════════════════════════════════════
+# ── Demo 모드 ────────────────────────────────────────────────────
 
 def _run_demo(df_input, companies):
     from demo_generator import build_agent2_output
     logger.info("[DEMO] 5개년 가상 재무 데이터 생성 중...")
-    df = build_agent2_output(companies, df_input)
-    return df
+    return build_agent2_output(companies, df_input)
 
 
-# ══════════════════════════════════════════════════════════════
-#  메인 진입점
-# ══════════════════════════════════════════════════════════════
+# ── 메인 ─────────────────────────────────────────────────────────
 
 def run(df_agent1=None, companies=None):
     logger.info("=" * 55)
@@ -206,7 +213,6 @@ def run(df_agent1=None, companies=None):
         logger.error("재무 데이터 수집 실패")
         return None
 
-    # 컬럼 정렬
     cols_priority = ['ticker', 'name', 'year', 'revenue', 'operating_profit',
                      'operating_margin', 'net_income', 'roe', 'roa',
                      'eps', 'bps', 'per', 'pbr']
@@ -217,7 +223,7 @@ def run(df_agent1=None, companies=None):
     df_out.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
     df_out.to_excel(OUTPUT_EXCEL, index=False)
 
-    logger.info(f"\n[결과] 수집 완료: {len(df_out)}행 ({df_out['ticker'].nunique()}개 종목)")
+    logger.info(f"\n[결과] {len(df_out)}행 ({df_out['ticker'].nunique()}개 종목)")
     logger.info(f"[저장] {OUTPUT_FILE}")
     logger.info(f"[저장] {OUTPUT_EXCEL}")
     return df_out

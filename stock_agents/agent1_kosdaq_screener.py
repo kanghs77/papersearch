@@ -1,20 +1,13 @@
 """
 Agent 1: 코스닥 종목 중 영업이익 흑자 기업 선별
 
-[Production 모드]
-  종목 코드 수집 우선순위:
-    1. FinanceDataReader (가장 안정적, finance-datareader 패키지 필요)
-    2. Naver Finance 시장 요약 페이지 스크래핑
-  영업이익 수집: Naver Finance finsum_more 페이지 스크래핑 (병렬)
-
-[Demo 모드]
-  - 현실적인 합성 데이터 사용 (네트워크 불필요)
+종목 코드: FinanceDataReader (확인됨)
+영업이익:  yfinance (.KQ 접미사) → Naver Finance 순서로 시도
 """
-import os
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from config import DATA_DIR, DATA_MODE, SCRAPE_MAX_WORKERS, SCRAPE_DELAY
+from config import DATA_DIR, DATA_MODE, SCRAPE_MAX_WORKERS
 from utils import get_request, logger
 
 OUTPUT_FILE = DATA_DIR / 'agent1_positive_op.csv'
@@ -28,181 +21,97 @@ _HEADERS = {
 }
 
 
-# ══════════════════════════════════════════════════════════════
-#  종목 코드 수집 — 3가지 방법 순서대로 시도
-# ══════════════════════════════════════════════════════════════
+# ── 종목 코드 수집 ───────────────────────────────────────────────
 
-def _get_kosdaq_tickers_fdr():
-    """FinanceDataReader로 코스닥 종목 리스트 수집 (가장 안정적)"""
+def _get_tickers_fdr():
+    import FinanceDataReader as fdr
+    df = fdr.StockListing('KOSDAQ')
+    code_col = 'Code' if 'Code' in df.columns else df.columns[0]
+    name_col = 'Name' if 'Name' in df.columns else df.columns[1]
+    result = {str(r[code_col]).zfill(6): str(r[name_col]) for _, r in df.iterrows()}
+    logger.info(f"FinanceDataReader: {len(result)}개 종목")
+    return result
+
+
+# ── 영업이익 수집 ────────────────────────────────────────────────
+
+def _op_from_yfinance(code: str):
+    """yfinance로 최근 연도 영업이익(억원) 수집"""
     try:
-        import FinanceDataReader as fdr
-        df = fdr.StockListing('KOSDAQ')
-        # Code 컬럼이 숫자형일 수 있으므로 문자열 6자리로 변환
-        code_col = 'Code' if 'Code' in df.columns else df.columns[0]
-        name_col = 'Name' if 'Name' in df.columns else df.columns[1]
-        ticker_map = {
-            str(row[code_col]).zfill(6): str(row[name_col])
-            for _, row in df.iterrows()
-        }
-        logger.info(f"FinanceDataReader로 {len(ticker_map)}개 종목 수집")
-        return ticker_map
-    except ImportError:
-        logger.warning("FinanceDataReader 미설치 → 다음 방법 시도")
-        return None
-    except Exception as e:
-        logger.warning(f"FinanceDataReader 실패: {e}")
-        return None
+        import yfinance as yf
+        t = yf.Ticker(f"{code}.KQ")
+        fin = t.financials   # 연간 손익계산서
+        if fin is None or fin.empty:
+            return None
+        for field in ['Operating Income', 'Operating Profit', 'EBIT']:
+            if field in fin.index:
+                for date, val in fin.loc[field].items():
+                    if pd.notna(val):
+                        return code, float(val) / 1e8, str(date.year)
+    except Exception:
+        pass
+    return None
 
 
-def _get_kosdaq_tickers_pykrx():
-    """pykrx로 코스닥 종목 코드 수집 (KRX_ID/KRX_PW 환경변수 필요)"""
-    krx_id = os.environ.get('KRX_ID')
-    krx_pw = os.environ.get('KRX_PW')
-    if not (krx_id and krx_pw):
-        return None
-    try:
-        from pykrx import stock
-        tickers = stock.get_market_ticker_list(market='KOSDAQ')
-        names = {t: stock.get_market_ticker_name(t) for t in tickers}
-        logger.info(f"pykrx로 {len(names)}개 종목 수집")
-        return names
-    except Exception as e:
-        logger.warning(f"pykrx 실패: {e}")
-        return None
-
-
-def _get_kosdaq_tickers_naver():
-    """Naver Finance 시장 요약 페이지 스크래핑으로 종목 코드 수집"""
-    from bs4 import BeautifulSoup
-    tickers = {}
-    # .nhn 과 .naver 두 URL 모두 시도
-    base_urls = [
-        'https://finance.naver.com/sise/sise_market_sum.naver',
-        'https://finance.naver.com/sise/sise_market_sum.nhn',
-    ]
-    working_url = None
-    for url in base_urls:
-        resp = get_request(url, params={'sosok': '1', 'page': '1'},
-                           headers=_HEADERS, encoding='euc-kr', timeout=10)
-        if resp and len(resp.text) > 1000:
-            working_url = url
-            break
-
-    if not working_url:
-        logger.warning("Naver Finance 시장 요약 페이지 접근 실패")
-        return None
-
-    for page in range(1, 50):
-        resp = get_request(working_url,
-                           params={'sosok': '1', 'page': str(page)},
-                           headers=_HEADERS, encoding='euc-kr', timeout=10)
-        if not resp:
-            break
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # 여러 선택자 순서대로 시도
-        rows = (
-            soup.select('table.type_2 tr[onmouseover]') or
-            soup.select('table.type_2 tbody tr') or
-            soup.select('tr[onmouseover]')
-        )
-        if not rows:
-            break
-
-        found_any = False
-        for row in rows:
-            a = row.select_one('td.col_name a') or row.select_one('a[href*="code="]')
-            if a:
-                href = a.get('href', '')
-                code = href.split('code=')[-1].split('&')[0] if 'code=' in href else ''
-                name = a.text.strip()
-                if code and len(code) == 6:
-                    tickers[code] = name
-                    found_any = True
-        if not found_any:
-            break
-        time.sleep(SCRAPE_DELAY)
-
-    logger.info(f"Naver Finance 스크래핑으로 {len(tickers)}개 종목 수집")
-    return tickers if tickers else None
-
-
-# ══════════════════════════════════════════════════════════════
-#  영업이익 스크래핑
-# ══════════════════════════════════════════════════════════════
-
-def _scrape_op_naver(code: str):
-    """Naver Finance finsum_more에서 최근 영업이익 파싱"""
+def _op_from_naver(code: str):
+    """Naver Finance에서 영업이익 파싱 (fallback)"""
     from bs4 import BeautifulSoup
     url = 'https://finance.naver.com/item/coinfo.naver'
     params = {'code': code, 'target': 'finsum_more'}
     headers = {**_HEADERS, 'Referer': f'https://finance.naver.com/item/main.naver?code={code}'}
-    resp = get_request(url, params=params, headers=headers, encoding='euc-kr', timeout=12)
+    resp = get_request(url, params=params, headers=headers, encoding='euc-kr', timeout=10)
     if not resp:
         return None
-
     soup = BeautifulSoup(resp.text, 'html.parser')
-    # 여러 선택자 시도
-    table = (
-        soup.find('table', class_='tb_type1') or
-        soup.find('table', {'class': lambda c: c and 'tb_type1' in c}) or
-        soup.find('table')
-    )
+    # 여러 테이블 선택자 시도
+    table = (soup.find('table', class_='tb_type1') or
+             soup.find('table', attrs={'class': lambda c: c and 'tb_type1' in str(c)}))
     if not table:
         return None
-
     years = []
     thead = table.find('thead')
     if thead:
         for th in thead.find_all('th'):
-            txt = th.text.strip()
-            if txt and txt != '구분':
-                years.append(txt)
-
-    tbody = table.find('tbody') or table
-    for tr in tbody.find_all('tr'):
+            t_ = th.text.strip()
+            if t_ and t_ != '구분':
+                years.append(t_)
+    for tr in (table.find('tbody') or table).find_all('tr'):
         th = tr.find('th')
         if not th:
             continue
         label = th.text.strip()
-        if '영업이익' in label and '률' not in label and 'E' not in label:
+        if '영업이익' in label and '률' not in label:
             for i, td in enumerate(tr.find_all('td')):
-                raw = td.text.strip().replace(',', '').replace('\xa0', '').replace(' ', '')
+                raw = td.text.strip().replace(',', '').replace('\xa0', '')
                 try:
                     val = float(raw)
-                    year = years[i] if i < len(years) else 'N/A'
-                    return code, val, year
+                    yr = years[i] if i < len(years) else 'N/A'
+                    return code, val, yr
                 except ValueError:
                     continue
     return None
 
 
-# ══════════════════════════════════════════════════════════════
-#  Production 모드 실행
-# ══════════════════════════════════════════════════════════════
+def _get_operating_profit(code: str):
+    """yfinance → Naver Finance 순으로 영업이익 수집"""
+    result = _op_from_yfinance(code)
+    if result is None:
+        result = _op_from_naver(code)
+    return result
+
+
+# ── Production 실행 ──────────────────────────────────────────────
 
 def _run_production():
-    logger.info("종목 코드 수집 중...")
-
-    # 우선순위 순으로 시도
-    ticker_map = (
-        _get_kosdaq_tickers_fdr() or
-        _get_kosdaq_tickers_pykrx() or
-        _get_kosdaq_tickers_naver()
-    )
-    if not ticker_map:
-        raise RuntimeError(
-            "종목 코드 수집 실패.\n"
-            "해결방법: pip install finance-datareader  (Windows CMD에서 실행)"
-        )
+    ticker_map = _get_tickers_fdr()
 
     tickers = list(ticker_map.keys())
-    logger.info(f"코스닥 종목 수: {len(tickers)}개")
-    logger.info(f"영업이익 스크래핑 시작 (병렬 {SCRAPE_MAX_WORKERS}개)")
+    logger.info(f"영업이익 수집 시작: {len(tickers)}개 (병렬 {SCRAPE_MAX_WORKERS})")
 
     results = []
-    with ThreadPoolExecutor(max_workers=SCRAPE_MAX_WORKERS) as ex:
-        futures = {ex.submit(_scrape_op_naver, t): t for t in tickers}
+    workers = min(SCRAPE_MAX_WORKERS, 10)   # yfinance 레이트 리밋 고려
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_get_operating_profit, t): t for t in tickers}
         done = 0
         for f in as_completed(futures):
             done += 1
@@ -214,37 +123,36 @@ def _run_production():
                     results.append({
                         'ticker': code_,
                         'name': ticker_map.get(code_, ''),
-                        'operating_profit': op,
+                        'operating_profit': round(op, 1),
                         'year': year,
                         'positive': op > 0,
                     })
             except Exception as e:
-                logger.debug(f"{code} 실패: {e}")
-            if done % 200 == 0:
-                logger.info(f"진행: {done}/{len(tickers)}")
-            time.sleep(SCRAPE_DELAY / SCRAPE_MAX_WORKERS)
+                logger.debug(f"{code}: {e}")
+            if done % 100 == 0:
+                logger.info(f"  진행: {done}/{len(tickers)} (수집 성공: {len(results)})")
+            time.sleep(0.3 / workers)
+
+    if not results:
+        raise RuntimeError(
+            "영업이익 데이터 수집 실패.\n"
+            "yfinance 설치 확인: pip install yfinance"
+        )
 
     df = pd.DataFrame(results)
-    if df.empty:
-        raise RuntimeError("영업이익 데이터 수집 실패 — Naver Finance 접근 불가")
     return df[df['positive'] == True].sort_values('operating_profit', ascending=False)
 
 
-# ══════════════════════════════════════════════════════════════
-#  Demo 모드
-# ══════════════════════════════════════════════════════════════
+# ── Demo 모드 ────────────────────────────────────────────────────
 
 def _run_demo():
     from demo_generator import generate_kosdaq_universe, build_agent1_output
     logger.info("[DEMO] 코스닥 가상 유니버스 생성 중...")
     companies = generate_kosdaq_universe(1500)
-    df = build_agent1_output(companies)
-    return df, companies
+    return build_agent1_output(companies), companies
 
 
-# ══════════════════════════════════════════════════════════════
-#  메인 진입점
-# ══════════════════════════════════════════════════════════════
+# ── 메인 ─────────────────────────────────────────────────────────
 
 def run():
     logger.info("=" * 55)
@@ -258,12 +166,10 @@ def run():
         df_positive, companies = _run_demo()
 
     df_positive.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
-
     logger.info(f"\n[결과] 영업이익 흑자 기업: {len(df_positive)}개")
     logger.info(f"[저장] {OUTPUT_FILE}")
-    logger.info("\n상위 10개 종목:")
+    logger.info("\n상위 10개:")
     logger.info(df_positive[['ticker', 'name', 'operating_profit', 'year']].head(10).to_string())
-
     return df_positive, companies
 
 
