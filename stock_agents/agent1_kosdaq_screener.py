@@ -109,8 +109,12 @@ def _run_production():
     logger.info(f"영업이익 수집 시작: {len(tickers)}개 (병렬 {SCRAPE_MAX_WORKERS})")
 
     results = []
-    workers = min(SCRAPE_MAX_WORKERS, 10)   # yfinance 레이트 리밋 고려
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # yfinance Rate Limit 대응: 워커 3개, 요청 간격 1.5초
+    WORKERS = 3
+    REQUEST_DELAY = 1.5
+    logger.info(f"  (워커 {WORKERS}개 / 요청 간격 {REQUEST_DELAY}s — Yahoo Finance Rate Limit 방지)")
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futures = {ex.submit(_get_operating_profit, t): t for t in tickers}
         done = 0
         for f in as_completed(futures):
@@ -131,7 +135,7 @@ def _run_production():
                 logger.debug(f"{code}: {e}")
             if done % 100 == 0:
                 logger.info(f"  진행: {done}/{len(tickers)} (수집 성공: {len(results)})")
-            time.sleep(0.3 / workers)
+            time.sleep(REQUEST_DELAY)
 
     if not results:
         raise RuntimeError(

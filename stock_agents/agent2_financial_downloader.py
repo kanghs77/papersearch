@@ -91,6 +91,18 @@ def _fetch_yfinance(code: str):
         return None
 
 
+def _fetch_yfinance_with_retry(code: str, max_retries: int = 3):
+    """Rate limit 대응: 실패 시 대기 후 재시도"""
+    for attempt in range(max_retries):
+        result = _fetch_yfinance(code)
+        if result is not None:
+            return result
+        wait = 5 * (attempt + 1)   # 5s → 10s → 15s
+        logger.debug(f"{code} yfinance 재시도 {attempt+1}/{max_retries} ({wait}s 대기)")
+        time.sleep(wait)
+    return None
+
+
 # ── Naver Finance fallback ───────────────────────────────────────
 
 def _fetch_naver(code: str):
@@ -145,7 +157,7 @@ def _fetch_naver(code: str):
 def _process(row):
     code = str(row['ticker']).zfill(6)
     name = row.get('name', '')
-    records = _fetch_yfinance(code) or _fetch_naver(code)
+    records = _fetch_yfinance_with_retry(code) or _fetch_naver(code)
     if records:
         for r in records:
             r.setdefault('ticker', code)
@@ -158,9 +170,15 @@ def _process(row):
 def _run_production(df_input):
     all_records = []
     success = fail = 0
-    workers = min(SCRAPE_MAX_WORKERS, 8)
+    failed_codes = []
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # yfinance Rate Limit 대응: 워커 3개, 요청 간격 1.5초
+    WORKERS = 3
+    REQUEST_DELAY = 1.5
+
+    logger.info(f"  (워커 {WORKERS}개 / 요청 간격 {REQUEST_DELAY}s — Yahoo Finance Rate Limit 방지)")
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futures = {ex.submit(_process, row): row['ticker'] for _, row in df_input.iterrows()}
         done = 0
         for f in as_completed(futures):
@@ -174,9 +192,26 @@ def _run_production(df_input):
                 success += 1
             else:
                 fail += 1
+                failed_codes.append(code_)
             if done % 50 == 0:
                 logger.info(f"  진행: {done}/{len(df_input)} | 성공: {success} | 실패: {fail}")
-            time.sleep(0.3 / workers)
+            time.sleep(REQUEST_DELAY)
+
+    # 실패 종목 재시도 (30초 대기 후)
+    if failed_codes:
+        logger.info(f"\n실패 {len(failed_codes)}개 재시도 중... (30초 대기)")
+        time.sleep(30)
+        retry_success = 0
+        for code in failed_codes:
+            row = df_input[df_input['ticker'].astype(str).str.zfill(6) == code]
+            if row.empty:
+                continue
+            _, records = _process(row.iloc[0])
+            if records:
+                all_records.extend(records)
+                retry_success += 1
+            time.sleep(2.0)
+        logger.info(f"재시도 결과: {retry_success}/{len(failed_codes)} 추가 성공")
 
     return pd.DataFrame(all_records)
 
