@@ -1,0 +1,14 @@
+FROM llama3.1
+
+# Ollama 기본 num_ctx=2048은 multi-agent context chain에 너무 짧음.
+# 8192로 늘리면 research_task → hw_task 컨텍스트가 잘리지 않음.
+# 3080 VRAM이 빠듯하면 4096으로 줄일 것.
+PARAMETER num_ctx 8192
+
+# 도구 호출 안정성
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+
+# 반복 억제 (small LLM이 같은 구절 무한 반복하는 것 방지)
+PARAMETER repeat_penalty 1.15
+PARAMETER repeat_last_n 256
